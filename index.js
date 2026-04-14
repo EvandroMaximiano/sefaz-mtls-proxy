@@ -9,7 +9,46 @@ app.use(express.json({ limit: '10mb' }));
 app.get('/', (req, res) => res.json({ status: 'ok', service: 'sefaz-mtls-proxy' }));
 app.get('/warmup', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
-// Extrai certPem, keyPem e o certificado em DER base64 do PFX
+// Mapa de endpoints RecepcaoEvento4 por UF (fonte oficial SEFAZ)
+const ENDPOINTS_EVENTO = {
+  AM: { host: 'nfe.sefaz.am.gov.br', path: '/services2/services/RecepcaoEvento4' },
+  BA: { host: 'nfe.sefaz.ba.gov.br', path: '/webservices/NFeRecepcaoEvento4/NFeRecepcaoEvento4.asmx' },
+  GO: { host: 'nfe.sefaz.go.gov.br', path: '/nfe/services/NFeRecepcaoEvento4' },
+  MG: { host: 'nfe.fazenda.mg.gov.br', path: '/nfe2/services/NFeRecepcaoEvento4' },
+  MS: { host: 'nfe.sefaz.ms.gov.br', path: '/ws/NFeRecepcaoEvento4' },
+  MT: { host: 'nfe.sefaz.mt.gov.br', path: '/nfews/v2/services/RecepcaoEvento4' },
+  PE: { host: 'nfe.sefaz.pe.gov.br', path: '/nfe-service/services/NFeRecepcaoEvento4' },
+  PR: { host: 'nfe.sefa.pr.gov.br', path: '/nfe/NFeRecepcaoEvento4' },
+  RS: { host: 'nfe.sefazrs.rs.gov.br', path: '/ws/recepcaoevento/recepcaoevento4.asmx' },
+  SP: { host: 'nfe.fazenda.sp.gov.br', path: '/ws/nferecepcaoevento4.asmx' },
+  // UFs que usam SVRS
+  AC: { host: 'nfe.svrs.rs.gov.br', path: '/ws/recepcaoevento/recepcaoevento4.asmx' },
+  AL: { host: 'nfe.svrs.rs.gov.br', path: '/ws/recepcaoevento/recepcaoevento4.asmx' },
+  AP: { host: 'nfe.svrs.rs.gov.br', path: '/ws/recepcaoevento/recepcaoevento4.asmx' },
+  CE: { host: 'nfe.svrs.rs.gov.br', path: '/ws/recepcaoevento/recepcaoevento4.asmx' },
+  DF: { host: 'nfe.svrs.rs.gov.br', path: '/ws/recepcaoevento/recepcaoevento4.asmx' },
+  ES: { host: 'nfe.svrs.rs.gov.br', path: '/ws/recepcaoevento/recepcaoevento4.asmx' },
+  MA: { host: 'www.sefazvirtual.fazenda.gov.br', path: '/NFeRecepcaoEvento4/NFeRecepcaoEvento4.asmx' },
+  PA: { host: 'nfe.svrs.rs.gov.br', path: '/ws/recepcaoevento/recepcaoevento4.asmx' },
+  PB: { host: 'nfe.svrs.rs.gov.br', path: '/ws/recepcaoevento/recepcaoevento4.asmx' },
+  PI: { host: 'nfe.svrs.rs.gov.br', path: '/ws/recepcaoevento/recepcaoevento4.asmx' },
+  RJ: { host: 'nfe.svrs.rs.gov.br', path: '/ws/recepcaoevento/recepcaoevento4.asmx' },
+  RN: { host: 'nfe.svrs.rs.gov.br', path: '/ws/recepcaoevento/recepcaoevento4.asmx' },
+  RO: { host: 'nfe.svrs.rs.gov.br', path: '/ws/recepcaoevento/recepcaoevento4.asmx' },
+  RR: { host: 'nfe.svrs.rs.gov.br', path: '/ws/recepcaoevento/recepcaoevento4.asmx' },
+  SC: { host: 'nfe.svrs.rs.gov.br', path: '/ws/recepcaoevento/recepcaoevento4.asmx' },
+  SE: { host: 'nfe.svrs.rs.gov.br', path: '/ws/recepcaoevento/recepcaoevento4.asmx' },
+  TO: { host: 'nfe.svrs.rs.gov.br', path: '/ws/recepcaoevento/recepcaoevento4.asmx' },
+};
+
+// Mapa UF código -> sigla para lookup reverso
+const CODIGO_PARA_UF = {
+  '12': 'AC', '27': 'AL', '16': 'AP', '13': 'AM', '29': 'BA', '23': 'CE', '53': 'DF',
+  '32': 'ES', '52': 'GO', '21': 'MA', '51': 'MT', '50': 'MS', '31': 'MG', '15': 'PA',
+  '25': 'PB', '41': 'PR', '26': 'PE', '22': 'PI', '33': 'RJ', '24': 'RN', '43': 'RS',
+  '11': 'RO', '14': 'RR', '42': 'SC', '35': 'SP', '28': 'SE', '17': 'TO'
+};
+
 function extrairPemDoPfx(pfxBase64, senha) {
   const pfxDer = forge.util.decode64(pfxBase64);
   const pfxAsn1 = forge.asn1.fromDer(pfxDer);
@@ -24,20 +63,18 @@ function extrairPemDoPfx(pfxBase64, senha) {
   const cert = certBags[0].cert;
   const certPem = forge.pki.certificateToPem(cert);
   const keyPem = forge.pki.privateKeyToPem(keyBags[0].key);
-  // Certificado em base64 DER para incluir no XML assinado
   const certDer = forge.util.encode64(forge.asn1.toDer(forge.pki.certificateToAsn1(cert)).getBytes());
 
-  return { certPem, keyPem, certDer, cert };
+  return { certPem, keyPem, certDer };
 }
 
-// Requisição mTLS para a SEFAZ
-function requisitarSefaz(soap, certPem, keyPem, soapAction, path) {
+function requisitarSefaz(soap, certPem, keyPem, soapAction, host, path) {
   return new Promise((resolve, reject) => {
     const soapBytes = Buffer.from(soap, 'utf-8');
     const options = {
-      hostname: 'www1.nfe.fazenda.gov.br',
+      hostname: host,
       port: 443,
-      path: path || '/NFeDistribuicaoDFe/NFeDistribuicaoDFe.asmx',
+      path: path,
       method: 'POST',
       headers: {
         'Content-Type': 'text/xml; charset=utf-8',
@@ -55,7 +92,7 @@ function requisitarSefaz(soap, certPem, keyPem, soapAction, path) {
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
         if (res.statusCode !== 200) {
-          reject(new Error(`SEFAZ status ${res.statusCode}: ${data.substring(0, 300)}`));
+          reject(new Error(`SEFAZ ${host} status ${res.statusCode}: ${data.substring(0, 300)}`));
         } else {
           resolve(data);
         }
@@ -63,7 +100,7 @@ function requisitarSefaz(soap, certPem, keyPem, soapAction, path) {
     });
 
     req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout na requisição SEFAZ')); });
+    req.on('timeout', () => { req.destroy(); reject(new Error(`Timeout em ${host}`)); });
     req.write(soapBytes);
     req.end();
   });
@@ -74,7 +111,6 @@ function extrairCStat(xml) {
   return m ? m[1] : null;
 }
 
-// Monta SOAP de distribuição DFe por NSU
 function montarSoapDistribuicao(cnpj, uf, nsu) {
   const nsuFormatado = String(nsu).padStart(15, '0');
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -97,32 +133,15 @@ function montarSoapDistribuicao(cnpj, uf, nsu) {
 </soapenv:Envelope>`;
 }
 
-// Monta evento de Ciência da Operação (tpEvento=210210) assinado
-function montarEventoCiencia(cnpj, chNFe, certDer, keyPem) {
+function montarXmlEvento(cnpj, chNFe, certDer, keyPem) {
   const dhEvento = new Date().toISOString().replace(/\.\d{3}Z$/, '-03:00');
-  const nSeqEvento = '1';
   const tpEvento = '210210';
-  const cOrgao = chNFe.substring(0, 2); // UF da chave
-
-  // XML do evento sem assinatura
+  const nSeqEvento = '1';
+  const cOrgao = chNFe.substring(0, 2);
   const infEventoId = `ID${tpEvento}${chNFe}${nSeqEvento.padStart(2, '0')}`;
-  const xmlEvento = `<evento xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.00">
-  <infEvento Id="${infEventoId}">
-    <cOrgao>${cOrgao}</cOrgao>
-    <tpAmb>1</tpAmb>
-    <CNPJ>${cnpj}</CNPJ>
-    <chNFe>${chNFe}</chNFe>
-    <dhEvento>${dhEvento}</dhEvento>
-    <tpEvento>${tpEvento}</tpEvento>
-    <nSeqEvento>${nSeqEvento}</nSeqEvento>
-    <verEvento>1.00</verEvento>
-    <detEvento versao="1.00">
-      <descEvento>Ciencia da Operacao</descEvento>
-    </detEvento>
-  </infEvento>
-</evento>`;
 
-  // Assina o XML
+  const xmlEvento = `<evento xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.00"><infEvento Id="${infEventoId}"><cOrgao>${cOrgao}</cOrgao><tpAmb>1</tpAmb><CNPJ>${cnpj}</CNPJ><chNFe>${chNFe}</chNFe><dhEvento>${dhEvento}</dhEvento><tpEvento>${tpEvento}</tpEvento><nSeqEvento>${nSeqEvento}</nSeqEvento><verEvento>1.00</verEvento><detEvento versao="1.00"><descEvento>Ciencia da Operacao</descEvento></detEvento></infEvento></evento>`;
+
   try {
     const sig = new SignedXml({ privateKey: keyPem });
     sig.addReference({
@@ -139,10 +158,15 @@ function montarEventoCiencia(cnpj, chNFe, certDer, keyPem) {
       getKeyInfo: () => `<X509Data><X509Certificate>${certDer}</X509Certificate></X509Data>`
     };
     sig.computeSignature(xmlEvento);
-    const xmlAssinado = sig.getSignedXml();
+    return sig.getSignedXml();
+  } catch(e) {
+    console.error('[assinar] Erro:', e.message);
+    return null;
+  }
+}
 
-    // Envelope SOAP para envio de evento
-    return `<?xml version="1.0" encoding="UTF-8"?>
+function montarSoapEvento(xmlEventoAssinado) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:nfe="http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4">
   <soapenv:Header/>
   <soapenv:Body>
@@ -150,49 +174,43 @@ function montarEventoCiencia(cnpj, chNFe, certDer, keyPem) {
       <nfe:nfeDadosMsg>
         <envEvento xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.00">
           <idLote>1</idLote>
-          ${xmlAssinado}
+          ${xmlEventoAssinado}
         </envEvento>
       </nfe:nfeDadosMsg>
     </nfe:nfeRecepcaoEvento>
   </soapenv:Body>
 </soapenv:Envelope>`;
-  } catch(e) {
-    console.error('[evento] Erro ao assinar:', e.message);
-    return null;
-  }
 }
 
-// Envia evento de Ciência da Operação para credenciar o CNPJ
-async function enviarCienciaOperacao(cnpj, chNFe, uf, certPem, keyPem, certDer) {
-  console.log(`[ciencia] Enviando Ciência da Operação para chave ${chNFe.substring(0,10)}...`);
-  
-  const soapEvento = montarEventoCiencia(cnpj, chNFe, certDer, keyPem);
-  if (!soapEvento) {
-    console.log('[ciencia] Falha ao montar evento, pulando...');
-    return false;
-  }
+async function enviarCienciaOperacao(cnpj, chNFe, ufSigla, certPem, keyPem, certDer) {
+  console.log(`[ciencia] CNPJ ${cnpj} | chave ${chNFe.substring(0,10)}... | UF ${ufSigla}`);
 
-  // Determina UF para o endpoint de eventos
-  const cUF = chNFe.substring(0, 2);
-  const ufEventoPath = '/NFeRecepcaoEvento4/NFeRecepcaoEvento4.asmx';
-  
+  const xmlAssinado = montarXmlEvento(cnpj, chNFe, certDer, keyPem);
+  if (!xmlAssinado) return { ok: false, erro: 'Falha ao assinar evento' };
+
+  const soap = montarSoapEvento(xmlAssinado);
+  const endpoint = ENDPOINTS_EVENTO[ufSigla] || ENDPOINTS_EVENTO['SP'];
+
+  console.log(`[ciencia] Endpoint: ${endpoint.host}${endpoint.path}`);
+
   try {
     const xmlResp = await requisitarSefaz(
-      soapEvento, certPem, keyPem,
+      soap, certPem, keyPem,
       '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4/nfeRecepcaoEvento"',
-      ufEventoPath
+      endpoint.host,
+      endpoint.path
     );
     const cStat = extrairCStat(xmlResp);
     console.log(`[ciencia] Resposta cStat=${cStat}`);
-    // 135=evento registrado, 573=duplicidade (já foi registrado antes) — ambos ok
-    return cStat === '135' || cStat === '573' || cStat === '138';
+    // 135=registrado, 573=duplicado (já registrado antes) — ambos indicam sucesso
+    return { ok: cStat === '135' || cStat === '573', cStat, xml: xmlResp };
   } catch(e) {
     console.error('[ciencia] Erro:', e.message);
-    return false;
+    return { ok: false, erro: e.message };
   }
 }
 
-// Endpoint principal de consulta de NF-e
+// Endpoint principal: consulta DFe com credenciamento automático via Ciência da Operação
 app.post('/consultar-nfes', async (req, res) => {
   const { pfxBase64, senha, cnpj, uf, nsu = 0, chaveCredenciamento } = req.body;
 
@@ -203,33 +221,31 @@ app.post('/consultar-nfes', async (req, res) => {
   try {
     const cnpjLimpo = cnpj.replace(/\D/g, '');
     const { certPem, keyPem, certDer } = extrairPemDoPfx(pfxBase64, senha);
-    const soapAction = '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe/nfeDistDFeInteresse"';
 
-    // Primeira tentativa de consulta
+    // UF sigla para lookup do endpoint de eventos
+    const ufSigla = CODIGO_PARA_UF[String(uf)] || 'SP';
+
+    const DFE_HOST = 'www1.nfe.fazenda.gov.br';
+    const DFE_PATH = '/NFeDistribuicaoDFe/NFeDistribuicaoDFe.asmx';
+    const DFE_ACTION = '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe/nfeDistDFeInteresse"';
+
+    // Primeira tentativa
     const soap = montarSoapDistribuicao(cnpjLimpo, uf, nsu);
-    let xmlResposta = await requisitarSefaz(soap, certPem, keyPem, soapAction);
+    let xmlResposta = await requisitarSefaz(soap, certPem, keyPem, DFE_ACTION, DFE_HOST, DFE_PATH);
     let cStat = extrairCStat(xmlResposta);
-    console.log(`[consultar] CNPJ ${cnpjLimpo} | NSU ${nsu} | cStat=${cStat}`);
+    console.log(`[consultar] CNPJ ${cnpjLimpo} UF ${ufSigla} | NSU ${nsu} | cStat=${cStat}`);
 
-    // Se 656, tenta credenciar via Ciência da Operação e repetir
+    // Se 656 e temos chave, envia Ciência da Operação no endpoint correto da UF
     if (cStat === '656' && chaveCredenciamento) {
-      console.log(`[consultar] cStat=656, enviando Ciência da Operação para credenciar...`);
-      await enviarCienciaOperacao(cnpjLimpo, chaveCredenciamento, uf, certPem, keyPem, certDer);
-      
-      // Aguarda propagação e tenta de novo
+      console.log(`[consultar] cStat=656, enviando Ciência da Operação via endpoint de ${ufSigla}...`);
+      const resultado = await enviarCienciaOperacao(cnpjLimpo, chaveCredenciamento, ufSigla, certPem, keyPem, certDer);
+      console.log(`[consultar] Ciência resultado:`, resultado.ok, resultado.cStat);
+
+      // Aguarda propagação e tenta novamente
       await new Promise(r => setTimeout(r, 3000));
-      xmlResposta = await requisitarSefaz(montarSoapDistribuicao(cnpjLimpo, uf, nsu), certPem, keyPem, soapAction);
+      xmlResposta = await requisitarSefaz(montarSoapDistribuicao(cnpjLimpo, uf, nsu), certPem, keyPem, DFE_ACTION, DFE_HOST, DFE_PATH);
       cStat = extrairCStat(xmlResposta);
-      console.log(`[consultar] Após credenciamento: cStat=${cStat}`);
-    } else if (cStat === '656') {
-      // Sem chave, tenta algumas vezes com delay
-      for (let i = 1; i <= 3; i++) {
-        await new Promise(r => setTimeout(r, 3000));
-        xmlResposta = await requisitarSefaz(montarSoapDistribuicao(cnpjLimpo, uf, nsu), certPem, keyPem, soapAction);
-        cStat = extrairCStat(xmlResposta);
-        console.log(`[consultar] Retry ${i}: cStat=${cStat}`);
-        if (cStat !== '656') break;
-      }
+      console.log(`[consultar] Após Ciência: cStat=${cStat}`);
     }
 
     res.json({ success: true, xml: xmlResposta, cStat });
@@ -239,7 +255,7 @@ app.post('/consultar-nfes', async (req, res) => {
   }
 });
 
-// Endpoint dedicado para enviar Ciência da Operação
+// Endpoint dedicado para Ciência da Operação
 app.post('/ciencia-operacao', async (req, res) => {
   const { pfxBase64, senha, cnpj, uf, chNFe } = req.body;
   if (!pfxBase64 || !senha || !cnpj || !chNFe) {
@@ -247,9 +263,10 @@ app.post('/ciencia-operacao', async (req, res) => {
   }
   try {
     const cnpjLimpo = cnpj.replace(/\D/g, '');
+    const ufSigla = CODIGO_PARA_UF[String(uf)] || uf || 'SP';
     const { certPem, keyPem, certDer } = extrairPemDoPfx(pfxBase64, senha);
-    const ok = await enviarCienciaOperacao(cnpjLimpo, chNFe, uf, certPem, keyPem, certDer);
-    res.json({ success: ok });
+    const resultado = await enviarCienciaOperacao(cnpjLimpo, chNFe, ufSigla, certPem, keyPem, certDer);
+    res.json(resultado);
   } catch(err) {
     res.status(500).json({ error: err.message });
   }
