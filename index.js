@@ -1,14 +1,15 @@
 const express = require('express');
 const https = require('https');
 const forge = require('node-forge');
+const { SignedXml } = require('xml-crypto');
 const app = express();
 
 app.use(express.json({ limit: '10mb' }));
 
-// Health check
 app.get('/', (req, res) => res.json({ status: 'ok', service: 'sefaz-mtls-proxy' }));
+app.get('/warmup', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
-// Extrai certPem e keyPem do PFX base64
+// Extrai certPem, keyPem e o certificado em DER base64 do PFX
 function extrairPemDoPfx(pfxBase64, senha) {
   const pfxDer = forge.util.decode64(pfxBase64);
   const pfxAsn1 = forge.asn1.fromDer(pfxDer);
@@ -20,20 +21,23 @@ function extrairPemDoPfx(pfxBase64, senha) {
   if (!certBags.length) throw new Error('Certificado não encontrado no PFX');
   if (!keyBags.length) throw new Error('Chave privada não encontrada no PFX');
 
-  const certPem = forge.pki.certificateToPem(certBags[0].cert);
+  const cert = certBags[0].cert;
+  const certPem = forge.pki.certificateToPem(cert);
   const keyPem = forge.pki.privateKeyToPem(keyBags[0].key);
+  // Certificado em base64 DER para incluir no XML assinado
+  const certDer = forge.util.encode64(forge.asn1.toDer(forge.pki.certificateToAsn1(cert)).getBytes());
 
-  return { certPem, keyPem };
+  return { certPem, keyPem, certDer, cert };
 }
 
-// Faz requisição mTLS genérica para a SEFAZ
-function requisitarSefaz(soap, certPem, keyPem, soapAction) {
+// Requisição mTLS para a SEFAZ
+function requisitarSefaz(soap, certPem, keyPem, soapAction, path) {
   return new Promise((resolve, reject) => {
     const soapBytes = Buffer.from(soap, 'utf-8');
     const options = {
       hostname: 'www1.nfe.fazenda.gov.br',
       port: 443,
-      path: '/NFeDistribuicaoDFe/NFeDistribuicaoDFe.asmx',
+      path: path || '/NFeDistribuicaoDFe/NFeDistribuicaoDFe.asmx',
       method: 'POST',
       headers: {
         'Content-Type': 'text/xml; charset=utf-8',
@@ -42,7 +46,8 @@ function requisitarSefaz(soap, certPem, keyPem, soapAction) {
       },
       cert: certPem,
       key: keyPem,
-      rejectUnauthorized: false
+      rejectUnauthorized: false,
+      timeout: 30000
     };
 
     const req = https.request(options, (res) => {
@@ -50,7 +55,7 @@ function requisitarSefaz(soap, certPem, keyPem, soapAction) {
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
         if (res.statusCode !== 200) {
-          reject(new Error(`SEFAZ retornou status ${res.statusCode}: ${data.substring(0, 300)}`));
+          reject(new Error(`SEFAZ status ${res.statusCode}: ${data.substring(0, 300)}`));
         } else {
           resolve(data);
         }
@@ -58,12 +63,18 @@ function requisitarSefaz(soap, certPem, keyPem, soapAction) {
     });
 
     req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout na requisição SEFAZ')); });
     req.write(soapBytes);
     req.end();
   });
 }
 
-// Monta SOAP de distribuição de DF-e (consulta por NSU)
+function extrairCStat(xml) {
+  const m = xml.match(/<cStat>(\d+)<\/cStat>/);
+  return m ? m[1] : null;
+}
+
+// Monta SOAP de distribuição DFe por NSU
 function montarSoapDistribuicao(cnpj, uf, nsu) {
   const nsuFormatado = String(nsu).padStart(15, '0');
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -75,7 +86,7 @@ function montarSoapDistribuicao(cnpj, uf, nsu) {
         <distDFeInt xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.01">
           <tpAmb>1</tpAmb>
           <cUFAutor>${uf}</cUFAutor>
-          <CNPJ>${cnpj.replace(/\D/g, '')}</CNPJ>
+          <CNPJ>${cnpj}</CNPJ>
           <distNSU>
             <ultNSU>${nsuFormatado}</ultNSU>
           </distNSU>
@@ -86,125 +97,137 @@ function montarSoapDistribuicao(cnpj, uf, nsu) {
 </soapenv:Envelope>`;
 }
 
-// Monta SOAP de credenciamento do destinatário (habilita CNPJ para DFe)
-function montarSoapCredenciamento(cnpj, uf) {
-  const cnpjLimpo = cnpj.replace(/\D/g, '');
-  // Manifestação de ciência da operação em uma NF-e qualquer não é ideal
-  // O credenciamento real é feito via envio de evento do tipo 210210 (Ciência da Operação)
-  // ou simplesmente fazendo uma consulta com NSU=0 que registra o CNPJ como interessado
-  // Usamos consultarChNFe com chave fictícia para forçar registro — não, melhor:
-  // A SEFAZ registra automaticamente o destinatário ao receber qualquer consulta válida.
-  // Para forçar o credenciamento, fazemos uma consulta por chave de acesso conhecida
-  // OU simplesmente a própria consulta distNSU já credencia.
-  // Aqui implementamos o evento de "Ciência da Operação" que é o mais robusto:
-  const dhEvento = new Date().toISOString().substring(0, 19) + '-03:00';
+// Monta evento de Ciência da Operação (tpEvento=210210) assinado
+function montarEventoCiencia(cnpj, chNFe, certDer, keyPem) {
+  const dhEvento = new Date().toISOString().replace(/\.\d{3}Z$/, '-03:00');
   const nSeqEvento = '1';
-  const tpEvento = '210210'; // Ciência da Operação
+  const tpEvento = '210210';
+  const cOrgao = chNFe.substring(0, 2); // UF da chave
 
-  // Para credenciar sem uma chave específica, usamos a consulta de distribuição com NSU=0
-  // que é suficiente para registrar o CNPJ na SEFAZ como destinatário ativo
-  return montarSoapDistribuicao(cnpjLimpo, uf, 0);
-}
+  // XML do evento sem assinatura
+  const infEventoId = `ID${tpEvento}${chNFe}${nSeqEvento.padStart(2, '0')}`;
+  const xmlEvento = `<evento xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.00">
+  <infEvento Id="${infEventoId}">
+    <cOrgao>${cOrgao}</cOrgao>
+    <tpAmb>1</tpAmb>
+    <CNPJ>${cnpj}</CNPJ>
+    <chNFe>${chNFe}</chNFe>
+    <dhEvento>${dhEvento}</dhEvento>
+    <tpEvento>${tpEvento}</tpEvento>
+    <nSeqEvento>${nSeqEvento}</nSeqEvento>
+    <verEvento>1.00</verEvento>
+    <detEvento versao="1.00">
+      <descEvento>Ciencia da Operacao</descEvento>
+    </detEvento>
+  </infEvento>
+</evento>`;
 
-// Extrai cStat da resposta XML da SEFAZ
-function extrairCStat(xmlResposta) {
-  const match = xmlResposta.match(/<cStat>(\d+)<\/cStat>/);
-  return match ? match[1] : null;
-}
+  // Assina o XML
+  try {
+    const sig = new SignedXml({ privateKey: keyPem });
+    sig.addReference({
+      xpath: `//*[@Id='${infEventoId}']`,
+      digestAlgorithm: 'http://www.w3.org/2001/04/xmlenc#sha256',
+      transforms: [
+        'http://www.w3.org/2000/09/xmldsig#enveloped-signature',
+        'http://www.w3.org/2001/10/xml-exc-c14n#'
+      ]
+    });
+    sig.signatureAlgorithm = 'http://www.w3.org/2001/04/xmldsig-more#rsa-sha256';
+    sig.canonicalizationAlgorithm = 'http://www.w3.org/2001/10/xml-exc-c14n#';
+    sig.keyInfoProvider = {
+      getKeyInfo: () => `<X509Data><X509Certificate>${certDer}</X509Certificate></X509Data>`
+    };
+    sig.computeSignature(xmlEvento);
+    const xmlAssinado = sig.getSignedXml();
 
-// Tenta credenciar o CNPJ e aguarda propagação
-async function credenciarCNPJ(cnpj, uf, certPem, keyPem) {
-  console.log(`[credenciar] Iniciando credenciamento CNPJ ${cnpj} UF ${uf}`);
-  
-  // Faz até 3 tentativas de consulta com NSU=0 para registrar o destinatário
-  for (let tentativa = 1; tentativa <= 3; tentativa++) {
-    const soap = montarSoapDistribuicao(cnpj, uf, 0);
-    const soapAction = '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe/nfeDistDFeInteresse"';
-    
-    try {
-      const xml = await requisitarSefaz(soap, certPem, keyPem, soapAction);
-      const cStat = extrairCStat(xml);
-      console.log(`[credenciar] Tentativa ${tentativa}: cStat=${cStat}`);
-      
-      if (cStat === '138' || cStat === '137') {
-        // 138 = documentos localizados, 137 = nenhum documento localizado — ambos indicam CNPJ habilitado
-        console.log(`[credenciar] CNPJ habilitado com sucesso (cStat=${cStat})`);
-        return { habilitado: true, cStat };
-      }
-      
-      if (cStat === '656') {
-        console.log(`[credenciar] Tentativa ${tentativa}: CNPJ ainda não habilitado (656), aguardando...`);
-        // Aguarda 3 segundos entre tentativas
-        await new Promise(r => setTimeout(r, 3000));
-      } else {
-        // Outro status inesperado
-        console.log(`[credenciar] Status inesperado: ${cStat}`);
-        break;
-      }
-    } catch (err) {
-      console.error(`[credenciar] Erro na tentativa ${tentativa}:`, err.message);
-    }
-  }
-  
-  return { habilitado: false, cStat: '656' };
-}
-
-// Monta SOAP de consulta por NSU
-function montarSoapConsulta(cnpj, uf, nsu) {
-  const nsuFormatado = String(nsu).padStart(15, '0');
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:nfe="http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe">
+    // Envelope SOAP para envio de evento
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:nfe="http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4">
   <soapenv:Header/>
   <soapenv:Body>
-    <nfe:nfeDistDFeInteresse>
+    <nfe:nfeRecepcaoEvento>
       <nfe:nfeDadosMsg>
-        <distDFeInt xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.01">
-          <tpAmb>1</tpAmb>
-          <cUFAutor>${uf}</cUFAutor>
-          <CNPJ>${cnpj.replace(/\D/g, '')}</CNPJ>
-          <distNSU>
-            <ultNSU>${nsuFormatado}</ultNSU>
-          </distNSU>
-        </distDFeInt>
+        <envEvento xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.00">
+          <idLote>1</idLote>
+          ${xmlAssinado}
+        </envEvento>
       </nfe:nfeDadosMsg>
-    </nfe:nfeDistDFeInteresse>
+    </nfe:nfeRecepcaoEvento>
   </soapenv:Body>
 </soapenv:Envelope>`;
+  } catch(e) {
+    console.error('[evento] Erro ao assinar:', e.message);
+    return null;
+  }
 }
 
-// Endpoint de consulta com credenciamento automático
+// Envia evento de Ciência da Operação para credenciar o CNPJ
+async function enviarCienciaOperacao(cnpj, chNFe, uf, certPem, keyPem, certDer) {
+  console.log(`[ciencia] Enviando Ciência da Operação para chave ${chNFe.substring(0,10)}...`);
+  
+  const soapEvento = montarEventoCiencia(cnpj, chNFe, certDer, keyPem);
+  if (!soapEvento) {
+    console.log('[ciencia] Falha ao montar evento, pulando...');
+    return false;
+  }
+
+  // Determina UF para o endpoint de eventos
+  const cUF = chNFe.substring(0, 2);
+  const ufEventoPath = '/NFeRecepcaoEvento4/NFeRecepcaoEvento4.asmx';
+  
+  try {
+    const xmlResp = await requisitarSefaz(
+      soapEvento, certPem, keyPem,
+      '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeRecepcaoEvento4/nfeRecepcaoEvento"',
+      ufEventoPath
+    );
+    const cStat = extrairCStat(xmlResp);
+    console.log(`[ciencia] Resposta cStat=${cStat}`);
+    // 135=evento registrado, 573=duplicidade (já foi registrado antes) — ambos ok
+    return cStat === '135' || cStat === '573' || cStat === '138';
+  } catch(e) {
+    console.error('[ciencia] Erro:', e.message);
+    return false;
+  }
+}
+
+// Endpoint principal de consulta de NF-e
 app.post('/consultar-nfes', async (req, res) => {
-  const { pfxBase64, senha, cnpj, uf, nsu = 0 } = req.body;
+  const { pfxBase64, senha, cnpj, uf, nsu = 0, chaveCredenciamento } = req.body;
 
   if (!pfxBase64 || !senha || !cnpj || !uf) {
     return res.status(400).json({ error: 'pfxBase64, senha, cnpj e uf são obrigatórios' });
   }
 
   try {
-    const { certPem, keyPem } = extrairPemDoPfx(pfxBase64, senha);
+    const cnpjLimpo = cnpj.replace(/\D/g, '');
+    const { certPem, keyPem, certDer } = extrairPemDoPfx(pfxBase64, senha);
     const soapAction = '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe/nfeDistDFeInteresse"';
 
-    // Monta e executa consulta principal
-    const soap = montarSoapConsulta(cnpj, uf, nsu);
+    // Primeira tentativa de consulta
+    const soap = montarSoapDistribuicao(cnpjLimpo, uf, nsu);
     let xmlResposta = await requisitarSefaz(soap, certPem, keyPem, soapAction);
     let cStat = extrairCStat(xmlResposta);
+    console.log(`[consultar] CNPJ ${cnpjLimpo} | NSU ${nsu} | cStat=${cStat}`);
 
-    console.log(`[consultar] CNPJ ${cnpj} | NSU ${nsu} | cStat=${cStat}`);
-
-    // Se retornar 656 (não habilitado), tenta credenciar e repetir
-    if (cStat === '656') {
-      console.log(`[consultar] cStat=656, iniciando credenciamento automático...`);
+    // Se 656, tenta credenciar via Ciência da Operação e repetir
+    if (cStat === '656' && chaveCredenciamento) {
+      console.log(`[consultar] cStat=656, enviando Ciência da Operação para credenciar...`);
+      await enviarCienciaOperacao(cnpjLimpo, chaveCredenciamento, uf, certPem, keyPem, certDer);
       
-      // Aguarda 2 segundos e tenta novamente até 5 vezes
-      for (let tentativa = 1; tentativa <= 5; tentativa++) {
-        await new Promise(r => setTimeout(r, 2000));
-        
-        const soapRetry = montarSoapConsulta(cnpj, uf, nsu);
-        xmlResposta = await requisitarSefaz(soapRetry, certPem, keyPem, soapAction);
+      // Aguarda propagação e tenta de novo
+      await new Promise(r => setTimeout(r, 3000));
+      xmlResposta = await requisitarSefaz(montarSoapDistribuicao(cnpjLimpo, uf, nsu), certPem, keyPem, soapAction);
+      cStat = extrairCStat(xmlResposta);
+      console.log(`[consultar] Após credenciamento: cStat=${cStat}`);
+    } else if (cStat === '656') {
+      // Sem chave, tenta algumas vezes com delay
+      for (let i = 1; i <= 3; i++) {
+        await new Promise(r => setTimeout(r, 3000));
+        xmlResposta = await requisitarSefaz(montarSoapDistribuicao(cnpjLimpo, uf, nsu), certPem, keyPem, soapAction);
         cStat = extrairCStat(xmlResposta);
-        
-        console.log(`[consultar] Retry ${tentativa}: cStat=${cStat}`);
-        
+        console.log(`[consultar] Retry ${i}: cStat=${cStat}`);
         if (cStat !== '656') break;
       }
     }
@@ -216,9 +239,20 @@ app.post('/consultar-nfes', async (req, res) => {
   }
 });
 
-// Endpoint de warmup (acorda o serviço Render)
-app.get('/warmup', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+// Endpoint dedicado para enviar Ciência da Operação
+app.post('/ciencia-operacao', async (req, res) => {
+  const { pfxBase64, senha, cnpj, uf, chNFe } = req.body;
+  if (!pfxBase64 || !senha || !cnpj || !chNFe) {
+    return res.status(400).json({ error: 'pfxBase64, senha, cnpj e chNFe são obrigatórios' });
+  }
+  try {
+    const cnpjLimpo = cnpj.replace(/\D/g, '');
+    const { certPem, keyPem, certDer } = extrairPemDoPfx(pfxBase64, senha);
+    const ok = await enviarCienciaOperacao(cnpjLimpo, chNFe, uf, certPem, keyPem, certDer);
+    res.json({ success: ok });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
