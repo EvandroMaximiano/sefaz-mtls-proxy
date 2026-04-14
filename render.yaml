@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: sefaz-mtls-proxy
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: NODE_ENV
+        value: production
