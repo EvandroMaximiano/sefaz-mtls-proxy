@@ -180,6 +180,35 @@ function requisitarSefaz(soap, certPem, keyPem, soapAction, host, path) {
   });
 }
 
+function requisitarSefazSoap12(soap, certPem, keyPem, soapAction, host, path) {
+  return new Promise((resolve, reject) => {
+    const soapBytes = Buffer.from(soap, 'utf-8');
+    const cleanAction = soapAction.replace(/^"|"$/g, '');
+    const options = {
+      hostname: host, port: 443, path, method: 'POST',
+      headers: {
+        'Content-Type': 'application/soap+xml; charset=utf-8; action="' + cleanAction + '"',
+        'Content-Length': soapBytes.length
+      },
+      cert: certPem, key: keyPem,
+      rejectUnauthorized: false, timeout: 30000
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        if (res.statusCode !== 200) reject(new Error('SEFAZ ' + host + ' status ' + res.statusCode + ': ' + data.substring(0, 300)));
+        else resolve(data);
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout em ' + host)); });
+    req.write(soapBytes);
+    req.end();
+  });
+}
+
+
 function extrairCStat(xml) {
   const m = xml.match(/<cStat>(\d+)<\/cStat>/);
   return m ? m[1] : null;
@@ -365,8 +394,16 @@ app.post('/consultar-protocolo', async (req, res) => {
     const SVRS_UFS = ['AC','AL','AP','CE','DF','ES','MA','PA','PB','PI','RJ','RN','RO','RR','SC','SE','TO'];
     const endpoint = ENDPOINTS_CONSULTA[ufSigla] || (SVRS_UFS.includes(ufSigla) ? ENDPOINTS_CONSULTA.SVRS : ENDPOINTS_CONSULTA.SP);
 
+    // SP e alguns estados exigem SOAP 1.2
+    const SOAP12_UFS = ['SP', 'MG', 'GO', 'MT', 'MS', 'PE', 'AM'];
+    const usaSoap12 = SOAP12_UFS.includes(ufSigla);
+
+    const soapNs = usaSoap12
+      ? 'xmlns:soapenv="http://www.w3.org/2003/05/soap-envelope"'
+      : 'xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"';
+
     const soap = `<?xml version="1.0" encoding="UTF-8"?>
-<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:nfe="http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4">
+<soapenv:Envelope ${soapNs} xmlns:nfe="http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4">
   <soapenv:Header/>
   <soapenv:Body>
     <nfe:nfeConsultaNF2>
@@ -381,8 +418,10 @@ app.post('/consultar-protocolo', async (req, res) => {
   </soapenv:Body>
 </soapenv:Envelope>`;
 
-    console.log(`[consultar-protocolo] ${chNFe.substring(0,10)}... UF=${ufSigla} → ${endpoint.host}`);
-    const xmlResposta = await requisitarSefaz(soap, certPem, keyPem, endpoint.action, endpoint.host, endpoint.path);
+    console.log(`[consultar-protocolo] ${chNFe.substring(0,10)}... UF=${ufSigla} → ${endpoint.host} (SOAP${usaSoap12 ? '1.2' : '1.1'})`);
+    const xmlResposta = usaSoap12
+      ? await requisitarSefazSoap12(soap, certPem, keyPem, endpoint.action, endpoint.host, endpoint.path)
+      : await requisitarSefaz(soap, certPem, keyPem, endpoint.action, endpoint.host, endpoint.path);
 
     const cStat = extrairCStat(xmlResposta);
     const xMotivo = xmlResposta.match(/<xMotivo>(.*?)<\/xMotivo>/)?.[1] || '';
