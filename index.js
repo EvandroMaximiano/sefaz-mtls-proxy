@@ -332,3 +332,90 @@ app.post('/consultar-chave', async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
+
+// POST /consultar-protocolo — busca XML via NFeConsultaProtocolo no servidor do estado emitente
+app.post('/consultar-protocolo', async (req, res) => {
+  const { pfxBase64, senha, chNFe } = req.body;
+  if (!pfxBase64 || !senha || !chNFe) {
+    return res.status(400).json({ error: 'pfxBase64, senha e chNFe são obrigatórios' });
+  }
+  try {
+    const { certPem, keyPem } = extrairPemDoPfx(pfxBase64, senha);
+
+    // Detecta UF do emitente pela chave (posições 0-1 = cUF)
+    const cUF = chNFe.substring(0, 2);
+    const ufSigla = CODIGO_PARA_UF[cUF] || 'SP';
+
+    // Endpoints NFeConsultaProtocolo por UF
+    const ENDPOINTS_CONSULTA = {
+      SP: { host: 'nfe.fazenda.sp.gov.br',    path: '/ws/nfeconsulta4.asmx',                          action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
+      MG: { host: 'nfe.fazenda.mg.gov.br',    path: '/nfe2/services/NFeConsulta4',                    action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
+      PR: { host: 'nfe.sefa.pr.gov.br',       path: '/nfe/NFeConsultaProtocolo4',                     action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
+      RS: { host: 'nfe.sefazrs.rs.gov.br',    path: '/ws/NfeConsulta2/NfeConsulta2.asmx',             action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
+      BA: { host: 'nfe.sefaz.ba.gov.br',      path: '/webservices/NFeConsultaProtocolo4/NFeConsultaProtocolo4.asmx', action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
+      GO: { host: 'nfe.sefaz.go.gov.br',      path: '/nfe/services/NFeConsulta4',                     action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
+      MT: { host: 'nfe.sefaz.mt.gov.br',      path: '/nfews/v2/services/NfeConsulta2',                action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
+      MS: { host: 'nfe.sefaz.ms.gov.br',      path: '/ws/NFeConsultaProtocolo4',                      action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
+      PE: { host: 'nfe.sefaz.pe.gov.br',      path: '/nfe-service/services/NFeConsultaProtocolo4',    action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
+      AM: { host: 'nfe.sefaz.am.gov.br',      path: '/services2/services/NFeConsultaProtocolo4',      action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
+      // SVRS (estados que usam servidor virtual)
+      SVRS: { host: 'nfe.svrs.rs.gov.br',     path: '/ws/NfeConsulta2/NfeConsulta2.asmx',             action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
+    };
+
+    const SVRS_UFS = ['AC','AL','AP','CE','DF','ES','MA','PA','PB','PI','RJ','RN','RO','RR','SC','SE','TO'];
+    const endpoint = ENDPOINTS_CONSULTA[ufSigla] || (SVRS_UFS.includes(ufSigla) ? ENDPOINTS_CONSULTA.SVRS : ENDPOINTS_CONSULTA.SP);
+
+    const soap = `<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:nfe="http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4">
+  <soapenv:Header/>
+  <soapenv:Body>
+    <nfe:nfeConsultaNF2>
+      <nfe:nfeDadosMsg>
+        <consSitNFe xmlns="http://www.portalfiscal.inf.br/nfe" versao="4.00">
+          <tpAmb>1</tpAmb>
+          <xServ>CONSULTAR</xServ>
+          <chNFe>${chNFe}</chNFe>
+        </consSitNFe>
+      </nfe:nfeDadosMsg>
+    </nfe:nfeConsultaNF2>
+  </soapenv:Body>
+</soapenv:Envelope>`;
+
+    console.log(`[consultar-protocolo] ${chNFe.substring(0,10)}... UF=${ufSigla} → ${endpoint.host}`);
+    const xmlResposta = await requisitarSefaz(soap, certPem, keyPem, endpoint.action, endpoint.host, endpoint.path);
+
+    const cStat = extrairCStat(xmlResposta);
+    const xMotivo = xmlResposta.match(/<xMotivo>(.*?)<\/xMotivo>/)?.[1] || '';
+    console.log(`[consultar-protocolo] cStat=${cStat} | ${xMotivo}`);
+
+    // cStat=100 = NF-e autorizada com procNFe incluso
+    // cStat=101 = NF-e cancelada
+    // cStat=110 = NF-e denegada
+    let xmlCompleto = null;
+    if (cStat === '100' || cStat === '101' || cStat === '110') {
+      // O XML completo (procNFe) vem direto na resposta SOAP
+      const procNFeMatch = xmlResposta.match(/<procNFe[^>]*>[\s\S]*?<\/procNFe>/);
+      const nfeProcMatch = xmlResposta.match(/<nfeProc[^>]*>[\s\S]*?<\/nfeProc>/);
+      if (procNFeMatch) {
+        xmlCompleto = procNFeMatch[0];
+        console.log(`[consultar-protocolo] ✅ procNFe encontrado (${xmlCompleto.length} chars)`);
+      } else if (nfeProcMatch) {
+        xmlCompleto = nfeProcMatch[0];
+        console.log(`[consultar-protocolo] ✅ nfeProc encontrado (${xmlCompleto.length} chars)`);
+      } else {
+        // Tenta extrair a NF-e + protocolo manualmente
+        const nfeMatch = xmlResposta.match(/<NFe[^>]*>[\s\S]*?<\/NFe>/);
+        const protMatch = xmlResposta.match(/<protNFe[^>]*>[\s\S]*?<\/protNFe>/);
+        if (nfeMatch && protMatch) {
+          xmlCompleto = `<nfeProc versao="4.00" xmlns="http://www.portalfiscal.inf.br/nfe">${nfeMatch[0]}${protMatch[0]}</nfeProc>`;
+          console.log(`[consultar-protocolo] ✅ NFe+protNFe montados manualmente`);
+        }
+      }
+    }
+
+    res.json({ success: true, cStat, xMotivo, xml: xmlCompleto, xmlRaw: cStat !== '100' ? xmlResposta.substring(0, 500) : undefined });
+  } catch(err) {
+    console.error('[consultar-protocolo] Erro:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
