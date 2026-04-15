@@ -348,10 +348,10 @@ app.post('/consultar-protocolo', async (req, res) => {
 
     // Endpoints NFeConsultaProtocolo por UF
     const ENDPOINTS_CONSULTA = {
-      SP: { host: 'nfe.fazenda.sp.gov.br',    path: '/ws/nfeconsulta4.asmx',                          action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
-      MG: { host: 'nfe.fazenda.mg.gov.br',    path: '/nfe2/services/NFeConsulta4',                    action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
+      SP: { host: 'nfe.fazenda.sp.gov.br',    path: '/ws/nfeconsultaprotocolo4.asmx',                          action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
+      MG: { host: 'nfe.fazenda.mg.gov.br',    path: '/nfe2/services/NFeConsultaProtocolo4',                    action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
       PR: { host: 'nfe.sefa.pr.gov.br',       path: '/nfe/NFeConsultaProtocolo4',                     action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
-      RS: { host: 'nfe.sefazrs.rs.gov.br',    path: '/ws/NfeConsulta2/NfeConsulta2.asmx',             action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
+      RS: { host: 'nfe.sefazrs.rs.gov.br',    path: '/ws/NfeConsulta/NfeConsulta4.asmx',             action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
       BA: { host: 'nfe.sefaz.ba.gov.br',      path: '/webservices/NFeConsultaProtocolo4/NFeConsultaProtocolo4.asmx', action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
       GO: { host: 'nfe.sefaz.go.gov.br',      path: '/nfe/services/NFeConsulta4',                     action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
       MT: { host: 'nfe.sefaz.mt.gov.br',      path: '/nfews/v2/services/NfeConsulta2',                action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
@@ -359,7 +359,7 @@ app.post('/consultar-protocolo', async (req, res) => {
       PE: { host: 'nfe.sefaz.pe.gov.br',      path: '/nfe-service/services/NFeConsultaProtocolo4',    action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
       AM: { host: 'nfe.sefaz.am.gov.br',      path: '/services2/services/NFeConsultaProtocolo4',      action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
       // SVRS (estados que usam servidor virtual)
-      SVRS: { host: 'nfe.svrs.rs.gov.br',     path: '/ws/NfeConsulta2/NfeConsulta2.asmx',             action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
+      SVRS: { host: 'nfe.svrs.rs.gov.br',     path: '/ws/NfeConsulta/NfeConsulta4.asmx',             action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
     };
 
     const SVRS_UFS = ['AC','AL','AP','CE','DF','ES','MA','PA','PB','PI','RJ','RN','RO','RR','SC','SE','TO'];
