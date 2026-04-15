@@ -255,5 +255,74 @@ app.post('/consultar-nfes', async (req, res) => {
   }
 });
 
+// POST /consultar-chave — busca XML completo de uma NF-e por chave de acesso
+app.post('/consultar-chave', async (req, res) => {
+  const { pfxBase64, senha, cnpj, uf, chNFe } = req.body;
+  if (!pfxBase64 || !senha || !cnpj || !chNFe) {
+    return res.status(400).json({ error: 'pfxBase64, senha, cnpj e chNFe são obrigatórios' });
+  }
+  try {
+    const cnpjLimpo = cnpj.replace(/\D/g, '');
+    const ufCod = uf || '35';
+    const { certPem, keyPem } = extrairPemDoPfx(pfxBase64, senha);
+
+    const soap = `<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:nfe="http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe">
+  <soapenv:Header/>
+  <soapenv:Body>
+    <nfe:nfeDistDFeInteresse>
+      <nfe:nfeDadosMsg>
+        <distDFeInt xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.01">
+          <tpAmb>1</tpAmb>
+          <cUFAutor>${ufCod}</cUFAutor>
+          <CNPJ>${cnpjLimpo}</CNPJ>
+          <consChNFe>
+            <chNFe>${chNFe}</chNFe>
+          </consChNFe>
+        </distDFeInt>
+      </nfe:nfeDadosMsg>
+    </nfe:nfeDistDFeInteresse>
+  </soapenv:Body>
+</soapenv:Envelope>`;
+
+    const DFE_HOST = 'www1.nfe.fazenda.gov.br';
+    const DFE_PATH = '/NFeDistribuicaoDFe/NFeDistribuicaoDFe.asmx';
+    const DFE_ACTION = '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeDistribuicaoDFe/nfeDistDFeInteresse"';
+
+    const xmlResposta = await requisitarSefaz(soap, certPem, keyPem, DFE_ACTION, DFE_HOST, DFE_PATH);
+    const cStat = extrairCStat(xmlResposta);
+    const xMotivo = xmlResposta.match(/<xMotivo>(.*?)<\/xMotivo>/)?.[1] || '';
+    console.log(`[consultar-chave] chNFe=${chNFe.substring(0,10)}... | cStat=${cStat} | ${xMotivo}`);
+
+    // Extrai o docZip da resposta
+    const docZipMatch = xmlResposta.match(/<docZip[^>]*>(.*?)<\/docZip>/s);
+    let xmlCompleto = null;
+
+    if (docZipMatch && (cStat === '138' || cStat === '100')) {
+      // Descomprime o Gzip
+      const zlib = require('zlib');
+      try {
+        const buf = Buffer.from(docZipMatch[1].trim(), 'base64');
+        const decompressed = zlib.gunzipSync(buf);
+        xmlCompleto = decompressed.toString('utf-8');
+        console.log(`[consultar-chave] XML descomprimido: ${xmlCompleto.substring(0, 80)}`);
+      } catch(e) {
+        console.error('[consultar-chave] Erro decompress:', e.message);
+      }
+    }
+
+    res.json({
+      success: true,
+      cStat,
+      xMotivo,
+      xml: xmlCompleto,
+      xmlRaw: xmlResposta
+    });
+  } catch(err) {
+    console.error('[consultar-chave] Erro:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
