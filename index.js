@@ -298,14 +298,20 @@ app.post('/consultar-chave', async (req, res) => {
     const docZipMatch = xmlResposta.match(/<docZip[^>]*>(.*?)<\/docZip>/s);
     let xmlCompleto = null;
 
-    if (docZipMatch && (cStat === '138' || cStat === '100')) {
-      // Descomprime o Gzip
+    if (docZipMatch) {
+      // Descomprime o Gzip — independente do cStat, se veio docZip tenta extrair
       const zlib = require('zlib');
       try {
         const buf = Buffer.from(docZipMatch[1].trim(), 'base64');
         const decompressed = zlib.gunzipSync(buf);
         xmlCompleto = decompressed.toString('utf-8');
-        console.log(`[consultar-chave] XML descomprimido: ${xmlCompleto.substring(0, 80)}`);
+        // Se veio resNFe (resumo) em vez de procNFe, não retorna como XML completo
+        if (xmlCompleto.includes('<resNFe') && !xmlCompleto.includes('<procNFe') && !xmlCompleto.includes('<nfeProc')) {
+          console.log(`[consultar-chave] Recebeu resNFe (resumo) — cStat=${cStat} — aguardando procNFe`);
+          xmlCompleto = null;
+        } else {
+          console.log(`[consultar-chave] XML completo descomprimido cStat=${cStat}: ${xmlCompleto.substring(0, 80)}`);
+        }
       } catch(e) {
         console.error('[consultar-chave] Erro decompress:', e.message);
       }
