@@ -413,7 +413,7 @@ app.post('/consultar-protocolo', async (req, res) => {
       }
     }
 
-    res.json({ success: true, cStat, xMotivo, xml: xmlCompleto, xmlRaw: cStat !== '100' ? xmlResposta.substring(0, 500) : undefined });
+    res.json({ success: true, cStat, xMotivo, xml: xmlCompleto, xmlRaw: xmlResposta.substring(0, 800) });
   } catch(err) {
     console.error('[consultar-protocolo] Erro:', err.message);
     res.status(500).json({ error: err.message });
