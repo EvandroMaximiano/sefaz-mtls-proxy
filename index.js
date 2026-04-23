@@ -197,8 +197,8 @@ function requisitarSefazSoap12(soap, certPem, keyPem, soapAction, host, path) {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
-        if (res.statusCode !== 200) reject(new Error('SEFAZ ' + host + ' status ' + res.statusCode + ': ' + data.substring(0, 300)));
-        else resolve(data);
+        // SOAP 1.2: aceita 200 e 500 (500 pode ter cStat válido)
+        resolve(data);
       });
     });
     req.on('error', reject);
@@ -377,7 +377,7 @@ app.post('/consultar-protocolo', async (req, res) => {
 
     // Endpoints NFeConsultaProtocolo por UF
     const ENDPOINTS_CONSULTA = {
-      SP: { host: 'nfe.fazenda.sp.gov.br',    path: '/ws/nfeconsultaprotocolo4.asmx',                          action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
+      SP: { host: 'nfe.fazenda.sp.gov.br',    path: '/ws/nfeconsultaprotocolo4.asmx',                          action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF"' },
       MG: { host: 'nfe.fazenda.mg.gov.br',    path: '/nfe2/services/NFeConsultaProtocolo4',                    action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
       PR: { host: 'nfe.sefa.pr.gov.br',       path: '/nfe/NFeConsultaProtocolo4',                     action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
       RS: { host: 'nfe.sefazrs.rs.gov.br',    path: '/ws/NfeConsulta/NfeConsulta4.asmx',             action: '"http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4/nfeConsultaNF2"' },
@@ -394,16 +394,17 @@ app.post('/consultar-protocolo', async (req, res) => {
     const SVRS_UFS = ['AC','AL','AP','CE','DF','ES','MA','PA','PB','PI','RJ','RN','RO','RR','SC','SE','TO'];
     const endpoint = ENDPOINTS_CONSULTA[ufSigla] || (SVRS_UFS.includes(ufSigla) ? ENDPOINTS_CONSULTA.SVRS : ENDPOINTS_CONSULTA.SP);
 
-    // SP e alguns estados exigem SOAP 1.2
+    // SP e alguns estados exigem SOAP 1.2 com estrutura document-style
     const SOAP12_UFS = ['SP', 'MG', 'GO', 'MT', 'MS', 'PE', 'AM'];
     const usaSoap12 = SOAP12_UFS.includes(ufSigla);
 
-    const soapNs = usaSoap12
-      ? 'xmlns:soapenv="http://www.w3.org/2003/05/soap-envelope"'
-      : 'xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"';
-
-    const soap = `<?xml version="1.0" encoding="UTF-8"?>
-<soapenv:Envelope ${soapNs} xmlns:nfe="http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4">
+    let soap;
+    if (usaSoap12) {
+      // SOAP 1.2: nfeDadosMsg direto no body, sem identação (SEFAZ SP rejeita whitespace)
+      soap = '<?xml version="1.0" encoding="UTF-8"?><soapenv:Envelope xmlns:soapenv="http://www.w3.org/2003/05/soap-envelope" xmlns:tns="http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4"><soapenv:Body><tns:nfeDadosMsg><consSitNFe xmlns="http://www.portalfiscal.inf.br/nfe" versao="4.00"><tpAmb>1</tpAmb><xServ>CONSULTAR</xServ><chNFe>' + chNFe + '</chNFe></consSitNFe></tns:nfeDadosMsg></soapenv:Body></soapenv:Envelope>';
+    } else {
+      soap = `<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:nfe="http://www.portalfiscal.inf.br/nfe/wsdl/NFeConsultaProtocolo4">
   <soapenv:Header/>
   <soapenv:Body>
     <nfe:nfeConsultaNF2>
@@ -417,6 +418,7 @@ app.post('/consultar-protocolo', async (req, res) => {
     </nfe:nfeConsultaNF2>
   </soapenv:Body>
 </soapenv:Envelope>`;
+    }
 
     console.log(`[consultar-protocolo] ${chNFe.substring(0,10)}... UF=${ufSigla} → ${endpoint.host} (SOAP${usaSoap12 ? '1.2' : '1.1'})`);
     const xmlResposta = usaSoap12
